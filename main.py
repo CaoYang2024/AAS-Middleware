@@ -1,126 +1,124 @@
-import aas_middleware
-import time
-import threading
-import os
+import typing
 import cv2
-from fastapi import FastAPI
+import aas_middleware
 from fastapi.responses import StreamingResponse
 import uvicorn
-import typing
 
 # ========== 配置 ==========
-PUBLISH_TO_LAN = True  # ← ← ← 控制是否发布到局域网
-
-CAMERA_INDEXES = [0, 1]
+PUBLISH_TO_LAN = True
+CAMERA_INDEXES = [0, 1]  # CSI 是 0，USB 是 1
 caps = [cv2.VideoCapture(i) for i in CAMERA_INDEXES]
 
-# ========== 传感器类 ==========
-class Sensor(aas_middleware.Submodel):
-    sensor_type: str
-    manufacturer: str
-    frame_rate: typing.Optional[float] = None
-    resolution: typing.Optional[str] = None
-    bitrate: typing.Optional[str] = None
-    aspect_ratio: typing.Optional[float] = None
-    lightness: typing.Optional[float] = None
-    brightness: typing.Optional[float] = None
-    hue: typing.Optional[float] = None
-    saturation: typing.Optional[float] = None
+# ========== 自定义子模型结构 ==========
+class Video(aas_middleware.SubmodelElementCollection):
+    URL: str
 
-class Camera(Sensor):
-    built_in_microphone: str
-    built_in_speaker: str
-    stream_type: str
-    image_mode: str
-    webcam_megapixels: float
-    video_standard: str
-    png_file_size: str
-    jpeg_file_size: str
-    number_of_colors: int
-    average_rgb_color: str
-    luminosity: typing.Optional[float] = None
+class GeneralInfo(aas_middleware.Submodel):
+    data_info: Video
+    manufacterer: str
+    product_type: str
 
-class Lidar(Sensor):
-    range: float
+class ProcessModel(aas_middleware.Submodel):
+    processes: typing.List[str]
 
-class SDV(aas_middleware.AAS):
-    camera: Camera
-    lidar: Lidar
+class Camera(aas_middleware.AAS):
+    basic_info: GeneralInfo
+    process_model: typing.Optional[ProcessModel]
 
-example_sdv = SDV(
-    id="SoftwareDefinedVehicle",
-    id_short="SDV_ID",
-    description="Software Defined Vehicle with Sensors",
-    camera=Camera(
-        id="camera_1",
-        id_short="Camera_1_ID",
-        description="Front Camera",
-        sensor_type="Camera",
-        manufacturer="GENERAL WEBCAM",
-        built_in_microphone="None",
-        built_in_speaker="None",
-        frame_rate=25.0,
-        resolution="1920x1080",
-        bitrate="10.04 MB/s",
-        aspect_ratio=1.78,
-        lightness=53.73,
-        brightness=53.59,
-        hue=255,
-        saturation=1.69,
-        stream_type="video",
-        image_mode="rgb",
-        webcam_megapixels=2.07,
-        video_standard="FHD",
-        png_file_size="1.06 MB",
-        jpeg_file_size="406.69 kB",
-        number_of_colors=32697,
-        average_rgb_color="gray",
-        luminosity=53.13
+# ========== CSI 摄像头 AAS ==========
+csi_camera = Camera(
+    id="csi_camera",
+    id_short="camera_csi",
+    description="CSI camera on Raspberry Pi",
+    basic_info=GeneralInfo(
+        id="general_info_csi",
+        id_short="GeneralInfoCSI",
+        description="CSI camera info",
+        manufacterer="Raspberry Pi",
+        product_type="csi_camera",
+        data_info=Video(
+            id="video_csi",
+            id_short="VideoCSI",
+            description="Video stream CSI",
+            URL="http://192.168.31.160:8000/camera_csi/video_feed"
+        ),
     ),
-    lidar=Lidar(
-        id="lidar_1",
-        id_short="Lidar_1_ID",
-        description="Front Lidar",
-        sensor_type="Lidar",
-        manufacturer="Example Lidar Manufacturer",
-        range=100.0
+    process_model=ProcessModel(
+        id="process_model_csi",
+        id_short="ProcessCSI",
+        description="Process for CSI",
+        processes=["recording", "streaming"]
+    )
+)
+
+# ========== USB 摄像头 AAS ==========
+usb_camera = Camera(
+    id="usb_camera",
+    id_short="camera_usb",
+    description="USB camera connected to Raspberry Pi",
+    basic_info=GeneralInfo(
+        id="general_info_usb",
+        id_short="GeneralInfoUSB",
+        description="USB camera info",
+        manufacterer="Generic USB",
+        product_type="usb_camera",
+        data_info=Video(
+            id="video_usb",
+            id_short="VideoUSB",
+            description="Video stream USB",
+            URL="http://192.168.31.160:8000/camera_usb/video_feed"
+        ),
     ),
+    process_model=ProcessModel(
+        id="process_model_usb",
+        id_short="ProcessUSB",
+        description="Process for USB",
+        processes=["monitoring", "streaming"]
+    )
 )
 
 # ========== AAS Middleware ==========
-data_model = aas_middleware.DataModel.from_models(example_sdv)
+data_model_csi = aas_middleware.DataModel.from_models(csi_camera)
+data_model_usb = aas_middleware.DataModel.from_models(usb_camera)
+
 middleware = aas_middleware.Middleware()
-middleware.load_data_model("sdv", data_model, persist_instances=True)
-middleware.generate_rest_api_for_data_model("sdv")
-middleware.generate_graphql_api_for_data_model("sdv")
+middleware.load_data_model("camera_csi", data_model_csi, persist_instances=True)
+middleware.load_data_model("camera_usb", data_model_usb, persist_instances=True)
 
-app = middleware.app  # 继承 FastAPI app
-
-# ========== 视频流处理函数 ==========
+middleware.generate_rest_api_for_data_model("camera_csi")
+middleware.generate_rest_api_for_data_model("camera_usb")
+middleware.generate_graphql_api_for_data_model("camera_csi")
+middleware.generate_graphql_api_for_data_model("camera_usb")
+app = middleware.app
+print(middleware.data_models.keys())  # 是否含 "camera_usb"
+# ========== 视频流处理 ==========
 def generate_frames(cam_index: int):
     cap = caps[cam_index]
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
             break
-        else:
-            _, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        _, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-# ========== 路由定义 ==========
-@app.get("/sdv/camera0/video_feed")
-def video_feed_0():
+# ========== 视频流路由 ==========
+@app.get("/camera_csi/video_feed")
+def video_feed_csi():
     return StreamingResponse(generate_frames(0), media_type="multipart/x-mixed-replace; boundary=frame")
 
-@app.get("/sdv/camera1/video_feed")
-def video_feed_1():
+@app.get("/camera_usb/video_feed")
+def video_feed_usb():
     return StreamingResponse(generate_frames(1), media_type="multipart/x-mixed-replace; boundary=frame")
 
 # ========== 启动服务 ==========
 if __name__ == "__main__":
     HOST = "0.0.0.0" if PUBLISH_TO_LAN else "127.0.0.1"
     PORT = 8000
-    print(f"🚀 视频服务启动中：{'局域网发布' if PUBLISH_TO_LAN else '本地发布'}，访问地址：http://{HOST}:{PORT}/sdv/camera0/video_feed")
+    print("🚀 视频与 AAS 服务已启动：")
+    print(f"  - CSI 视频流: http://{HOST}:{PORT}/camera_csi/video_feed")
+    print(f"  - CSI AAS信息: http://{HOST}:{PORT}/camera_csi/")
+    print(f"  - USB 视频流: http://{HOST}:{PORT}/camera_usb/video_feed")
+    print(f"  - USB AAS信息: http://{HOST}:{PORT}/camera_usb/")
     uvicorn.run(app, host=HOST, port=PORT)
