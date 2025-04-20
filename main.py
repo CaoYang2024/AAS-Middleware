@@ -5,15 +5,20 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 import requests
 import uvicorn
+from picamera2 import Picamera2
+import time
 
 # ========== 配置 ==========
 PUBLISH_TO_LAN = True
-CSI_STREAM_URL = "http://127.0.0.1:8001"  # rpicam-vid 推流地址
 USB_CAMERA_INDEX = 0
 
 # 初始化 USB 摄像头
 cap_usb = cv2.VideoCapture(USB_CAMERA_INDEX)
 
+# 初始化 CSI 摄像头（picamera2）
+picam2 = Picamera2()
+picam2.configure(picam2.create_video_configuration(main={"size": (640, 480)}))
+picam2.start()
 
 # ====== 通用子模型结构定义 ======
 
@@ -73,6 +78,7 @@ camera_usb = CameraUSB(
         url="http://192.168.31.160:8000/camera_usb/video_feed"
     )
 )
+
 # ========== AAS Middleware ==========
 data_model_csi = aas_middleware.DataModel.from_models(camera_csi)
 data_model_usb = aas_middleware.DataModel.from_models(camera_usb)
@@ -90,12 +96,14 @@ middleware.generate_graphql_api_for_data_model("camera_usb")
 app: FastAPI = middleware.app
 
 # ========== 视频流处理 ==========
-def proxy_rpicam_stream():
-    """转发 rpicam-vid 推送的 MJPEG 视频流"""
-    with requests.get(CSI_STREAM_URL, stream=True) as r:
-        for chunk in r.iter_content(chunk_size=1024):
-            if chunk:
-                yield chunk
+def generate_csi_frames():
+    while True:
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        _, buffer = cv2.imencode('.jpg', frame)
+        jpg_frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpg_frame + b'\r\n')
 
 def generate_usb_frames():
     """读取 USB 摄像头的帧并转换为 MJPEG"""
@@ -110,16 +118,8 @@ def generate_usb_frames():
 
 # ========== 视频流路由 ==========
 @app.get("/camera_csi/video_feed")
-def generate_csi_rtsp_frames():
-    cap = cv2.VideoCapture("rtsp://127.0.0.1:8554/stream1")  # 或者换成树莓派 IP
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+def video_feed_csi():
+    return StreamingResponse(generate_csi_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.get("/camera_usb/video_feed")
 def video_feed_usb():
@@ -127,7 +127,7 @@ def video_feed_usb():
 
 # ========== 启动服务 ==========
 if __name__ == "__main__":
-    HOST = "127.0.0.1"
+    HOST = "192.168.31.160"
     PORT = 8000
     print("🚀 视频与 AAS 服务已启动：")
     print(f"  - Swagger 接口文档: http://{HOST}:{PORT}/docs")
