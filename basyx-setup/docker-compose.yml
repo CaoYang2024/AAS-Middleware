@@ -15,10 +15,12 @@ services:
         condition: service_healthy
       sm-registry:
         condition: service_healthy
+      mongo:
+        condition: service_healthy
       mosquitto:
         condition: service_healthy
   aas-registry:
-    image: eclipsebasyx/aas-registry-log-mem:2.0.0-SNAPSHOT
+    image: eclipsebasyx/aas-registry-log-mongodb:2.0.0-SNAPSHOT
     container_name: aas-registry
     ports:
       - '8082:8080'
@@ -27,8 +29,11 @@ services:
     volumes:
       - ./basyx/aas-registry.yml:/workspace/config/application.yml
     restart: always
+    depends_on:
+      mongo:
+        condition: service_healthy
   sm-registry:
-    image: eclipsebasyx/submodel-registry-log-mem:2.0.0-SNAPSHOT
+    image: eclipsebasyx/submodel-registry-log-mongodb:2.0.0-SNAPSHOT
     container_name: sm-registry
     ports:
       - '8083:8080'
@@ -37,6 +42,9 @@ services:
     volumes:
       - ./basyx/sm-registry.yml:/workspace/config/application.yml
     restart: always
+    depends_on:
+      mongo:
+        condition: service_healthy
   aas-discovery:
     image: eclipsebasyx/aas-discovery:2.0.0-SNAPSHOT
     container_name: aas-discovery
@@ -47,6 +55,21 @@ services:
     ports:
       - '8084:8081'
     restart: always
+    depends_on:
+      mongo:
+        condition: service_healthy
+  mongo:
+    image: mongo:5.0.10
+    container_name: mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongoAdmin
+      MONGO_INITDB_ROOT_PASSWORD: mongoPassword
+    restart: always
+    healthcheck:
+      test: mongo
+      interval: 10s
+      timeout: 5s
+      retries: 5
   mosquitto:
     image: eclipse-mosquitto:2.0.15
     container_name: mosquitto
@@ -91,15 +114,3 @@ services:
     depends_on:
       mongo:
         condition: service_healthy
-  mongo:
-    image: mongo:5.0.10
-    container_name: mongo
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: mongoAdmin
-      MONGO_INITDB_ROOT_PASSWORD: mongoPassword
-    restart: always
-    healthcheck:
-      test: mongo
-      interval: 10s
-      timeout: 5s
-      retries: 5
