@@ -1,38 +1,26 @@
 import simpy
 import requests
-import json
+from plot import plot_gantt_chart
 import paho.mqtt.client as mqtt
-from ASIL import execute_task
-from Fair import dispatch_fair_task
-from energy import dispatch_energy_aware_task
-
+from EDF import (
+    dispatch_earliest_deadline_task
+)
+from Dual import dispatch_hi_lo_shift_task
+from FP import dispatch_fixed_priority_task
+from Evaluation import evaluate
+from FIFO import dispatch_no_scheduling_task
 
 # --- Parameters ---
 NUM_SENSORS = 2
 SIM_TIME = 50
-MQTT_BROKER = "192.168.31.34"
+MQTT_BROKER = "172.22.80.1"
 MQTT_PORT = 1883
 MQTT_TOPIC = "simulation/task/finished"
 BASE_SUBMODEL_URL = "http://localhost:8081/submodels/aHR0cHM6Ly9leGFtcGxlLmNvbS9pZHMvc20vOTAyM18yMjEwXzUwNTJfOTY0Mg/submodel-elements"
-# mosquitto_sub -h 192.168.31.34 -t "simulation/task/finished" -v
-# --- Scheduling Strategy Summary ---
-# This simulation supports three scheduling strategies for sensor task execution:
-# 1. "mixed critical":
-#    - ASIL-D tasks have absolute priority.
-#    - They preempt all other tasks and require both sensors to execute simultaneously.
-#    - Other tasks are prioritized based on: 0.5 × safety_score + 0.5 × realtime_score − 0.1 × duration.
-#    - Non-D tasks only execute on one free sensor and can be preempted.
-#
-# 2. "fair":
-#    - Tasks are executed strictly in the order of arrival (FIFO).
-#    - Each task uses one available sensor.
-#    - No preemption is allowed, regardless of task criticality.
-#
-# 3. "energy-aware":
-#    - Tasks are prioritized using the same priority formula.
-#    - The strategy attempts to minimize sensor switching to reduce energy cost.
-#    - Each task is assigned to the sensor with the lowest load.
-#    - No preemption is allowed (except ASIL-D handled separately).
+
+# --- Global Task Completion Record ---
+completed_tasks = []
+
 # --- Strategy fetcher ---
 def fetch_strategy_from_basyx():
     strategy_url = "http://localhost:8081/submodels/aHR0cHM6Ly9leGFtcGxlLmNvbS9pZHMvc20vMTIzMF8zMjEwXzUwNTJfODI5Nw/submodel-elements/simpy"
@@ -43,7 +31,7 @@ def fetch_strategy_from_basyx():
         return data.get("value", "fair").strip().lower()
     except Exception as e:
         print(f"❌ Failed to fetch scheduling strategy: {e}")
-        return "fair"
+        return "fp"
 
 # --- Task list ---
 tasks = [{"id": f"Task{i}"} for i in range(1, 6)]
@@ -100,7 +88,7 @@ class Sensor:
 
 # --- Main Simulation ---
 env = simpy.Environment()
-sensors = [Sensor(env, "CSI"), Sensor(env, "USB")]
+sensor_unit = Sensor(env, "DualCameraUnit")
 
 # Load task details
 for task in tasks:
@@ -113,33 +101,61 @@ for task in tasks:
 
 # Task arrival plan
 arrival_plan = [
-    (0.0, "Task1"),
-    (0.5, "Task2"),
-    (1.5, "Task3"),
-    (2.0, "Task4"),
-    (3.0, "Task5"),
+    (0.0, "Task1"),  # Front Vehicle Distance Check
+    (0.5, "Task2"),  # Emergency Obstacle Detection
+    (1.5, "Task3"),  # Navigation Map Update
+    (2.0, "Task4"),  # Lane Detection
+    (3.0, "Task5"),  # Road Sign Recognition
 ]
 
-# Run simulation based on dynamic scheduling strategy
+# 语义驱动的 deadline 设定（时间窗口越紧，deadline 越靠前）
 for arrival_time, task_id in arrival_plan:
+    for task in tasks:
+        if task["id"] == task_id:
+            task["arrival_time"] = arrival_time
+            if task_id == "Task2":  # Emergency → 超高优先
+                slack = 1.0
+            elif task_id == "Task1":  # Distance Check → 较高优先
+                slack = 2.0
+            elif task_id == "Task4":  # Lane Detection → 中等优先
+                slack = 3.0
+            elif task_id == "Task3":  # Map Update → 可延迟
+                slack = 4.0
+            elif task_id == "Task5":  # Sign Recognition → 最不紧急
+                slack = 5.0
+            else:
+                slack = 3.0
+
+            task["deadline"] = arrival_time + task["duration"]+slack
+            print(f"📌 {task_id}: arrival={arrival_time}s, deadline={task['deadline']}s")
+
+# Run simulation based on dynamic scheduling strategy
+current_strategy = fetch_strategy_from_basyx()
+print(f"🔀 Strategy at {env.now:.2f}: {current_strategy}")
+
+for arrival_time, task_id in arrival_plan:
+    # 找到当前任务
     t = next(task for task in tasks if task["id"] == task_id)
 
+    # 推进仿真时间到 arrival_time（如果需要）
     if arrival_time > env.now:
         env.run(until=arrival_time)
 
-    current_strategy = fetch_strategy_from_basyx()
     print(f"🔀 Strategy at {env.now:.2f}: {current_strategy}")
 
-    if current_strategy == "mixed-critical":
-        env.process(execute_task(mqtt_client, MQTT_TOPIC, env, t, sensors))
-    elif current_strategy == "fair":
-        dispatch_fair_task(mqtt_client,MQTT_TOPIC,env, t, sensors)
-    elif current_strategy == "energy-aware":
-        dispatch_energy_aware_task(mqtt_client,MQTT_TOPIC,env, t, sensors)
+    if current_strategy == "fp":
+        dispatch_fixed_priority_task(mqtt_client, MQTT_TOPIC, env, t, sensor_unit, completed_tasks)
+    elif current_strategy == "edf":
+        dispatch_earliest_deadline_task(mqtt_client, MQTT_TOPIC, env, t, sensor_unit, completed_tasks)
+    elif current_strategy == "dual":
+        dispatch_hi_lo_shift_task(mqtt_client, MQTT_TOPIC, env, t, sensor_unit, completed_tasks)
     else:
-        print(f"⚠️ Unknown strategy '{current_strategy}', defaulting to fair.")
-        dispatch_fair_task(mqtt_client,MQTT_TOPIC,env, t, sensors)
+        print(f"⚠️ Unknown strategy '{current_strategy}', defaulting to no scheduling.")
+        dispatch_no_scheduling_task(mqtt_client, MQTT_TOPIC, env, t, sensor_unit, completed_tasks)
 
 env.run(until=SIM_TIME)
 mqtt_client.loop_stop()
 mqtt_client.disconnect()
+
+evaluate(completed_tasks)
+plot_gantt_chart(completed_tasks, current_strategy)
